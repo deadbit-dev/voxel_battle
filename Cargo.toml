@@ -1,7 +1,9 @@
 [package]
 name = "voxel_battle"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-raylib = { version = "5.0" }
+raylib = "5.0"
+noise = "0.7"
+rand = "0.8"

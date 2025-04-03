@@ -1,24 +1,36 @@
-use raylib::prelude::*;
+use std::time::Instant;
+use crate::state::GameState;
+use crate::logic::{init, update};
+use crate::rendering::render;
 
-const WINDOW_WIDTH: i32 = 640;
-const WINDOW_HEIGHT: i32 = 480;
-    
+mod state;
+mod logic;
+mod rendering;
+
+const SCREEN_WIDTH: i32 = 800;
+const SCREEN_HEIGHT: i32 = 600;
+
 fn main() {
-    let (mut rl,thread) = raylib::init()
-        .size(WINDOW_WIDTH, WINDOW_HEIGHT)
-        .title("Game")
+    let (mut rl, thread) = raylib::init()
+        .size(SCREEN_WIDTH, SCREEN_HEIGHT)
+        .title("Voxel Battle")
         .build();
 
+    let mut state = GameState::default();
+    
+    init(&mut state);
+    
+    rl.set_target_fps(240);
+    
+    let mut last_update = Instant::now();
     while !rl.window_should_close() {
-        let mut d = rl.begin_drawing(&thread);
-        
-        d.clear_background(Color::BLACK);
+        let dt = last_update.elapsed().as_secs_f32();
+        last_update = Instant::now();
 
-        const TEXT: &str = "Wellcome :)";
-        const FONT_SIZE: i32 = 20;
-        let text_width: i32 = d.measure_text(TEXT, FONT_SIZE);
-        let text_x: i32 = (WINDOW_WIDTH / 2) - (text_width / 2);
-        let text_y: i32 = WINDOW_HEIGHT / 2;
-        d.draw_text(TEXT, text_x, text_y, FONT_SIZE, Color::WHITE);
+        // Logic 
+        update(&mut state, dt);
+
+        // Render 
+        render(&state, &mut rl, &thread);
     }
 }
