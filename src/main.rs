@@ -1,16 +1,20 @@
 use std::time::Instant;
+use raylib::ffi::{SetConfigFlags, ConfigFlags};
 use crate::state::GameState;
 use crate::logic::{init, update};
 use crate::rendering::render;
+use crate::config::{SCREEN_WIDTH, SCREEN_HEIGHT};
 
 mod state;
 mod logic;
 mod rendering;
-
-const SCREEN_WIDTH: i32 = 800;
-const SCREEN_HEIGHT: i32 = 600;
+mod utils;
+mod config;
 
 fn main() {
+    unsafe {
+        SetConfigFlags(ConfigFlags::FLAG_MSAA_4X_HINT as u32);
+    }
     let (mut rl, thread) = raylib::init()
         .size(SCREEN_WIDTH, SCREEN_HEIGHT)
         .title("Voxel Battle")
@@ -20,7 +24,7 @@ fn main() {
     
     init(&mut state);
     
-    rl.set_target_fps(240);
+    // rl.set_target_fps(240);
     
     let mut last_update = Instant::now();
     while !rl.window_should_close() {

@@ -1,5 +1,10 @@
 use raylib::prelude::*;
-use crate::state::{GameState, World, VoxelType, PlayerInput, Voxel, PlayerState};
+use raylib::ffi::ShaderLocationIndex::SHADER_LOC_VECTOR_VIEW;
+use raylib::ffi::ShaderUniformDataType::SHADER_UNIFORM_VEC4;
+use crate::state::{GameState, PlayerInput, PlayerState, ShaderType, VoxelType, World, Voxel};
+use crate::utils::{generate_random_color, lerp_f32};
+use crate::config::{GLSL_VERSION, PLAYER_COLORS};
+
 
 pub fn init(state: &mut GameState) {
     state.world = World::default();
@@ -12,24 +17,90 @@ pub fn init(state: &mut GameState) {
         }
     }
     
+    // Initialize keyboard player input but don't create the player yet
     state.player_inputs.insert(0, PlayerInput {
         movement: Vector2::zero(),
         movement_speed: 5.0, // 5 units per second
     });
+
+    // Load basic lighting shader
+    let vs_path = std::ffi::CString::new(format!("resources/shaders/glsl{}/lighting.vs", GLSL_VERSION)).unwrap();
+    let fs_path = std::ffi::CString::new(format!("resources/shaders/glsl{}/lighting.fs", GLSL_VERSION)).unwrap();
     
-    // Set player position above the floor
-    let mut player = PlayerState::default();
-    player.position.x = state.world.width as f32 / 2.0; // Center X
-    player.position.y = 1.0; // Set player 1 unit above the floor
-    player.position.z = state.world.depth as f32 / 2.0; // Center Z
-    state.players.insert(0, player);
+    let shader = unsafe {
+        ffi::LoadShader(vs_path.as_ptr(), fs_path.as_ptr())
+    };
+    
+    // Get some required shader locations
+    let view_pos = std::ffi::CString::new("viewPos").unwrap();
+    unsafe {
+        let loc = ffi::GetShaderLocation(shader, view_pos.as_ptr());
+        *shader.locs.offset(SHADER_LOC_VECTOR_VIEW as isize) = loc;
+    }
+    
+    // Ambient light level (some basic lighting)
+    let ambient = std::ffi::CString::new("ambient").unwrap();
+    let ambient_loc = unsafe { ffi::GetShaderLocation(shader, ambient.as_ptr()) };
+    let ambient_color = [0.3f32, 0.3f32, 0.3f32, 1.0f32]; // Increased ambient light
+    unsafe {
+        ffi::SetShaderValue(shader, ambient_loc, ambient_color.as_ptr() as *const std::ffi::c_void, SHADER_UNIFORM_VEC4 as i32);
+    }
+
+    // Set up light source
+    let light_enabled = std::ffi::CString::new("lights[0].enabled").unwrap();
+    let light_type = std::ffi::CString::new("lights[0].type").unwrap();
+    let light_position = std::ffi::CString::new("lights[0].position").unwrap();
+    let light_color = std::ffi::CString::new("lights[0].color").unwrap();
+    
+    unsafe {
+        // Enable light
+        let enabled_loc = ffi::GetShaderLocation(shader, light_enabled.as_ptr());
+        let enabled = [1i32];
+        ffi::SetShaderValue(shader, enabled_loc, enabled.as_ptr() as *const std::ffi::c_void, ffi::ShaderUniformDataType::SHADER_UNIFORM_INT as i32);
+        
+        // Set light type to directional light
+        let type_loc = ffi::GetShaderLocation(shader, light_type.as_ptr());
+        let light_type = [0i32]; // LIGHT_DIRECTIONAL
+        ffi::SetShaderValue(shader, type_loc, light_type.as_ptr() as *const std::ffi::c_void, ffi::ShaderUniformDataType::SHADER_UNIFORM_INT as i32);
+        
+        // Set light target (direction)
+        let light_target = std::ffi::CString::new("lights[0].target").unwrap();
+        let target_loc = ffi::GetShaderLocation(shader, light_target.as_ptr());
+        let target = [state.light_source.target.x, state.light_source.target.y, state.light_source.target.z];
+        ffi::SetShaderValue(shader, target_loc, target.as_ptr() as *const std::ffi::c_void, ffi::ShaderUniformDataType::SHADER_UNIFORM_VEC3 as i32);
+        
+        // Set light position (still needed for directional light)
+        let pos_loc = ffi::GetShaderLocation(shader, light_position.as_ptr());
+        let pos = [state.light_source.position.x, state.light_source.position.y, state.light_source.position.z];
+        ffi::SetShaderValue(shader, pos_loc, pos.as_ptr() as *const std::ffi::c_void, ffi::ShaderUniformDataType::SHADER_UNIFORM_VEC3 as i32);
+        
+        // Set light color with reduced intensity
+        let color_loc = ffi::GetShaderLocation(shader, light_color.as_ptr());
+        let color = [
+            state.light_source.color.r as f32 / 255.0 * 0.8, // Reduced intensity
+            state.light_source.color.g as f32 / 255.0 * 0.8,
+            state.light_source.color.b as f32 / 255.0 * 0.8,
+            state.light_source.color.a as f32 / 255.0
+        ];
+        ffi::SetShaderValue(shader, color_loc, color.as_ptr() as *const std::ffi::c_void, SHADER_UNIFORM_VEC4 as i32);
+    }
+
+    state.shaders.insert(ShaderType::Lighting, shader);
 }
 
 pub fn update(state: &mut GameState, delta: f32) {
     // Toggle debug mode with M
     unsafe {
         if ffi::IsKeyPressed(KeyboardKey::KEY_M as i32) {
-            state.debug_mode = !state.debug_mode;
+            state.editor.active = !state.editor.active;
+            
+            if state.editor.active {
+                // Save camera state before entering debug mode
+                state.editor.camera.game_camera = Some(state.camera_state.camera);
+                state.editor.camera.game_camera_offset = Some(state.camera_state.offset);
+                state.editor.camera.game_camera_height = Some(state.camera_state.height);
+                state.editor.camera.game_camera_angle = Some(state.camera_state.angle);
+            }
         }
     }
 
@@ -39,7 +110,12 @@ pub fn update(state: &mut GameState, delta: f32) {
     update_camera(state, delta);
 }
 
-pub fn update_player_inputs(state: &mut GameState) {
+fn update_player_inputs(state: &mut GameState) {
+    // Get all currently used colors before any mutable borrows
+    let used_colors: Vec<Color> = state.players.values()
+        .map(|p| p.color)
+        .collect();
+
     // Update inputs for all players
     for (id, input) in state.player_inputs.iter_mut() {
         if *id == 0 {
@@ -60,6 +136,20 @@ pub fn update_player_inputs(state: &mut GameState) {
                 }
             }
             input.movement = movement;
+
+            // Check for space key to spawn keyboard player
+            if !state.players.contains_key(id) && state.players.len() < 5 && unsafe { ffi::IsKeyPressed(KeyboardKey::KEY_SPACE as i32) } {
+                if let Some(color) = generate_random_color(&used_colors, &PLAYER_COLORS) {
+                    let mut player = PlayerState::default();
+                    player.position.x = state.world.width as f32 / 2.0; // Center X
+                    player.position.y = 1.0; // Set player 1 unit above the floor
+                    player.position.z = state.world.depth as f32 / 2.0; // Center Z
+                    player.color = color;
+                    player.original_color = color;
+                    player.is_ready = true;
+                    state.players.insert(*id, player);
+                }
+            }
         } else {
             // Other players use gamepads
             let gamepad_id = (*id - 1) as i32; // Convert player ID to gamepad ID
@@ -89,16 +179,30 @@ pub fn update_player_inputs(state: &mut GameState) {
                         movement.y /= length;
                     }
                     
-                    // Increase movement speed for gamepad players
-                    input.movement_speed = 8.0;
+                    // Set same movement speed as keyboard players
+                    input.movement_speed = 5.0;
                     input.movement = movement;
+
+                    // Check for any gamepad input to spawn gamepad player
+                    if !state.players.contains_key(id) && state.players.len() < 5 && (movement.x != 0.0 || movement.y != 0.0) {
+                        if let Some(color) = generate_random_color(&used_colors, &PLAYER_COLORS) {
+                            let mut player = PlayerState::default();
+                            player.position.x = state.world.width as f32 / 2.0; // Center X
+                            player.position.y = 1.0; // Set player 1 unit above the floor
+                            player.position.z = state.world.depth as f32 / 2.0; // Center Z
+                            player.color = color;
+                            player.original_color = color;
+                            player.is_ready = true;
+                            state.players.insert(*id, player);
+                        }
+                    }
                 }
             }
         }
     }
 
     // Check for new gamepads only if we haven't reached the maximum number of players
-    if state.next_player_id < 5 { // Allow up to 4 gamepad players (IDs 1-4)
+    if state.next_player_id < 5 && state.players.len() < 5 { // Allow up to 4 gamepad players (IDs 1-4)
         for i in 0..4 {
             unsafe {
                 let is_available = ffi::IsGamepadAvailable(i);
@@ -107,21 +211,11 @@ pub fn update_player_inputs(state: &mut GameState) {
                     if !state.player_inputs.contains_key(&player_id) {
                         println!("New gamepad detected: {} -> Player {}", i, player_id);
                         
-                        // Create player input with higher speed
+                        // Create player input with same speed as keyboard players
                         state.player_inputs.insert(player_id, PlayerInput {
                             movement: Vector2::zero(),
-                            movement_speed: 8.0, // Increased speed for gamepad players
+                            movement_speed: 5.0, // Same speed as keyboard players
                         });
-                        
-                        // Create player state
-                        let mut player = PlayerState::default();
-                        player.position.x = state.world.width as f32 / 2.0; // Center X
-                        player.position.y = 1.0; // Set player 1 unit above the floor
-                        player.position.z = state.world.depth as f32 / 2.0; // Center Z
-                        player.color = Color { r: 255, g: 0, b: 0, a: 255 }; // Red color for gamepad players
-                        state.players.insert(player_id, player);
-                        
-                        state.next_player_id = player_id + 1;
                     }
                 }
             }
@@ -209,45 +303,138 @@ fn check_voxel_collision(world: &World, position: Vector3, size: Vector3) -> Opt
     None
 }
 
-pub fn update_player_position(state: &mut GameState, delta: f32) {
+fn update_player_position(state: &mut GameState, delta: f32) {
     for (id, input) in state.player_inputs.iter() {
         if let Some(player) = state.players.get_mut(id) {
-            // Calculate movement vector
-            let movement = Vector3::new(
-                input.movement.x * input.movement_speed * delta,
-                0.0,
-                input.movement.y * input.movement_speed * delta
-            );
+            // Update dash cooldown
+            if player.dash_cooldown > 0.0 {
+                player.dash_cooldown -= delta;
+            }
+
+            // Check for dash input based on player type
+            let is_dash_pressed = if *id == 0 {
+                // Keyboard player (ID 0) uses Shift key
+                unsafe { ffi::IsKeyPressed(KeyboardKey::KEY_LEFT_SHIFT as i32) }
+            } else {
+                // Gamepad players use right trigger
+                let gamepad_id = (*id - 1) as i32;
+                unsafe { ffi::IsGamepadButtonPressed(gamepad_id, GamepadButton::GAMEPAD_BUTTON_RIGHT_TRIGGER_1 as i32) }
+            };
+            
+            // Start dash if dash button is pressed, not already dashing, and cooldown is ready
+            if is_dash_pressed && !player.is_dashing && player.dash_cooldown <= 0.0 && input.movement.length() > 0.0 {
+                player.is_dashing = true;
+                player.dash_cooldown = 0.8; // Cooldown time
+                // Normalize the movement vector to ensure consistent dash speed in all directions
+                let normalized_movement = input.movement.normalized();
+                player.dash_direction = Vector3::new(normalized_movement.x, 0.0, normalized_movement.y);
+                // Store current velocity before dash
+                player.pre_dash_velocity = player.velocity;
+                // Store original color
+                player.original_color = player.color;
+                // Set initial dash velocity
+                player.velocity = player.dash_direction * 15.0;
+            }
+
+            // Update color during dash
+            if player.is_dashing {
+                let progress = (0.8 - player.dash_cooldown) / 0.8; // Progress from 0 to 1
+                if progress < 0.1 {
+                    // Smooth transition to white at the start
+                    let t = progress * 10.0; // Scale to 0-1 range
+                    player.color = Color {
+                        r: ((player.original_color.r as f32 * (1.0 - t) + 255.0 * t).min(255.0)) as u8,
+                        g: ((player.original_color.g as f32 * (1.0 - t) + 255.0 * t).min(255.0)) as u8,
+                        b: ((player.original_color.b as f32 * (1.0 - t) + 255.0 * t).min(255.0)) as u8,
+                        a: player.original_color.a,
+                    };
+                } else {
+                    // Smooth transition back to original color
+                    let t = (progress - 0.1) / 0.9; // Scale to 0-1 range
+                    player.color = Color {
+                        r: ((255.0 * (1.0 - t) + player.original_color.r as f32 * t).min(255.0)) as u8,
+                        g: ((255.0 * (1.0 - t) + player.original_color.g as f32 * t).min(255.0)) as u8,
+                        b: ((255.0 * (1.0 - t) + player.original_color.b as f32 * t).min(255.0)) as u8,
+                        a: player.original_color.a,
+                    };
+                }
+            } else if player.dash_cooldown > 0.0 {
+                // Continue smooth transition back to original color during cooldown
+                let progress = (0.8 - player.dash_cooldown) / 0.8; // Progress from 0 to 1
+                let t = progress; // Scale to 0-1 range
+                player.color = Color {
+                    r: ((255.0 * (1.0 - t) + player.original_color.r as f32 * t).min(255.0)) as u8,
+                    g: ((255.0 * (1.0 - t) + player.original_color.g as f32 * t).min(255.0)) as u8,
+                    b: ((255.0 * (1.0 - t) + player.original_color.b as f32 * t).min(255.0)) as u8,
+                    a: player.original_color.a,
+                };
+            } else {
+                // Reset to original color when cooldown is complete
+                player.color = player.original_color;
+            }
+
+            // Calculate target velocity based on input
+            let target_velocity = if player.is_dashing {
+                // During dash, maintain dash direction and speed
+                player.dash_direction * 20.0 // Increased from 20.0 to 30.0 for faster dash
+            } else {
+                // Normal movement
+                Vector3::new(
+                    input.movement.x * input.movement_speed * 1.5,
+                    0.0,
+                    input.movement.y * input.movement_speed * 1.5
+                )
+            };
+
+            // Calculate acceleration based on whether we're speeding up or slowing down
+            let acceleration_rate = if target_velocity.length() > 0.0 {
+                3.0 // Increased from 1.5 to 3.0 for faster acceleration
+            } else {
+                3.0 // Increased from 3.0 to 3.0 for faster deceleration
+            };
+
+            // Update velocity with acceleration (only if not dashing)
+            if !player.is_dashing {
+                let acceleration = (target_velocity - player.velocity) * acceleration_rate;
+                player.velocity += acceleration * delta;
+            }
+            
+            // Apply friction when no input is given and not dashing
+            if target_velocity.length() == 0.0 && !player.is_dashing {
+                let friction = 5.0; // Lower friction for smoother stopping
+                player.velocity = player.velocity.lerp(Vector3::zero(), friction * delta);
+            }
+
+            // End dash after 0.2 seconds
+            if player.is_dashing {
+                player.dash_cooldown -= delta;
+                if player.dash_cooldown <= 0.6 { // Dash duration is 0.2 seconds
+                    player.is_dashing = false;
+                    // Calculate interpolation factor based on remaining cooldown
+                    // This will give us a smooth transition from dash speed to pre-dash speed
+                    let transition_time = 0.03; // Reduced from 0.05 to 0.03 seconds for faster transition
+                    let transition_progress = (0.6 - player.dash_cooldown) / transition_time;
+                    let t = transition_progress.min(1.0); // Clamp to 1.0
+                    
+                    // Smoothly interpolate between dash velocity and pre-dash velocity
+                    player.velocity = player.velocity.lerp(player.pre_dash_velocity, t * 5.0); // Increased from 3.0 to 5.0 for faster transition
+                }
+            }
+
+            // Calculate movement based on velocity
+            let movement = player.velocity * delta;
 
             if movement.length() > 0.0 {
                 let new_position = player.position + movement;
                 let collision = check_voxel_collision(&state.world, new_position, player.size);
                 if collision.is_none() {
                     player.position = new_position;
+                } else {
+                    // Stop movement in the direction of collision
+                    player.velocity = Vector3::zero();
+                    // Also stop dash if we hit something
+                    player.is_dashing = false;
                 }
-                // TODO: implement more precise collision detection
-                // else {
-                //     println!("Collision: {:?}", collision.unwrap());
-                //     let mut voxel_pos = collision.unwrap().position;
-                //     let normalized_movement = movement.normalized();
-                //     voxel_pos.x -= normalized_movement.x;
-                //     voxel_pos.z -= normalized_movement.z;
-                //     let voxel_size = state.world.voxel_size;
-                //     let mut voxel_x = voxel_pos.x * voxel_size;
-                //     let mut voxel_z = voxel_pos.z * voxel_size;
-                //     if normalized_movement.x > 0.0 {
-                //         voxel_x += voxel_size / 2.0 - player.size.x / 2.0;
-                //     } else {
-                //         voxel_x -= voxel_size / 2.0 + player.size.x / 2.0;
-                //     }
-                //     if normalized_movement.z > 0.0 {
-                //         voxel_z += voxel_size / 2.0 - player.size.z / 2.0;
-                //     } else {
-                //         voxel_z -= voxel_size / 2.0 + player.size.z / 2.0;
-                //     }
-                //     println!("Voxel: {:?}, {:?}, {:?}", voxel_pos.x, voxel_pos.y, voxel_pos.z);
-                //     player.position = Vector3::new(voxel_x as f32, player.position.y, voxel_z as f32);
-                // }
             }
         }
     }
@@ -278,7 +465,7 @@ fn is_voxel_occupied_by_player(state: &GameState, x: i32, y: i32, z: i32) -> boo
 
 fn handle_voxel_input(state: &mut GameState) {
     let mouse_pos = unsafe { ffi::GetMousePosition() };
-    let ray: Ray = unsafe { ffi::GetScreenToWorldRay(mouse_pos, state.camera.into()).into() };
+    let ray: Ray = unsafe { ffi::GetScreenToWorldRay(mouse_pos, state.camera_state.camera.into()).into() };
     
     let voxel_size = state.world.voxel_size;
     let mut closest_collision: Option<(i32, i32, i32, f32, Vector3)> = None;
@@ -335,64 +522,109 @@ fn handle_voxel_input(state: &mut GameState) {
         }
     }
 
+    // Toggle build mode with right click
+    if unsafe { ffi::IsMouseButtonPressed(MouseButton::MOUSE_BUTTON_RIGHT as i32) } {
+        state.editor.build_mode = !state.editor.build_mode;
+    }
+
+    // Store the hovered position for rendering
+    if let Some((x, y, z, _, normal)) = closest_collision {
+        if state.editor.build_mode {
+            // In build mode, show where the new voxel will be placed
+            let (new_x, new_y, new_z) = if get_voxel(&state.world, x, y, z) == VoxelType::Empty {
+                (x, y, z)
+            } else {
+                // If clicking on an existing voxel, show where the new one will be placed
+                if normal.x > 0.5 { (x + 1, y, z) }
+                else if normal.x < -0.5 { (x - 1, y, z) }
+                else if normal.y > 0.5 { (x, y + 1, z) }
+                else if normal.y < -0.5 { (x, y - 1, z) }
+                else if normal.z > 0.5 { (x, y, z + 1) }
+                else { (x, y, z - 1) }
+            };
+            state.editor.hovered_voxel = Some((new_x, new_y, new_z));
+        } else {
+            // In remove mode, show the voxel that will be removed
+            state.editor.hovered_voxel = Some((x, y, z));
+        }
+    } else {
+        state.editor.hovered_voxel = None;
+    }
+
+    // Only handle voxel placement/removal in debug mode
+    if !state.editor.active {
+        return;
+    }
+
     if let Some((x, y, z, _, normal)) = closest_collision {
         // Check if there's already a voxel at this position
         let existing_voxel = get_voxel(&state.world, x, y, z);
         
         if unsafe { ffi::IsMouseButtonPressed(MouseButton::MOUSE_BUTTON_LEFT as i32) } {
-            if existing_voxel == VoxelType::Empty {
-                // Check if the new voxel position overlaps with any player
-                if !is_voxel_occupied_by_player(state, x, y, z) {
-                    // Get player height (assuming first player)
-                    let player_height = if let Some(player) = state.players.get(&0) {
-                        player.position.y
-                    } else {
-                        1.0 // Default height if no player
-                    };
-                    
-                    // Check if this was a floor voxel (y = 0) or if it's below player height
-                    let voxel_type = if y == 0 || (y as f32) < player_height {
-                        VoxelType::Ground
-                    } else {
-                        VoxelType::Wall
-                    };
-                    
-                    set_voxel(&mut state.world, x, y, z, voxel_type);
+            if state.editor.build_mode {
+                // Build mode - place new voxels
+                if existing_voxel == VoxelType::Empty {
+                    // Check if the new voxel position overlaps with any player
+                    if !is_voxel_occupied_by_player(state, x, y, z) {
+                        // Get player height (assuming first player)
+                        let player_height = if let Some(player) = state.players.get(&0) {
+                            player.position.y
+                        } else {
+                            1.0 // Default height if no player
+                        };
+                        
+                        // Check if this was a floor voxel (y = 0) or if it's below player height
+                        let voxel_type = if y == 0 || (y as f32) < player_height {
+                            VoxelType::Ground
+                        } else {
+                            VoxelType::Wall
+                        };
+                        
+                        set_voxel(&mut state.world, x, y, z, voxel_type);
+                    }
+                } else {
+                    // If clicking on an existing voxel, try to place a new one based on the clicked face
+                    let (new_x, new_y, new_z) = if normal.x > 0.5 { (x + 1, y, z) }
+                        else if normal.x < -0.5 { (x - 1, y, z) }
+                        else if normal.y > 0.5 { (x, y + 1, z) }
+                        else if normal.y < -0.5 { (x, y - 1, z) }
+                        else if normal.z > 0.5 { (x, y, z + 1) }
+                        else { (x, y, z - 1) };
+
+                    if new_x >= 0 && new_x < state.world.width &&
+                       new_y >= 0 && new_y < state.world.height &&
+                       new_z >= 0 && new_z < state.world.depth &&
+                       get_voxel(&state.world, new_x, new_y, new_z) == VoxelType::Empty &&
+                       !is_voxel_occupied_by_player(state, new_x, new_y, new_z) {
+                        // Get player height (assuming first player)
+                        let player_height = if let Some(player) = state.players.get(&0) {
+                            player.position.y
+                        } else {
+                            1.0 // Default height if no player
+                        };
+                        
+                        // Set voxel type based on height relative to player
+                        let voxel_type = if new_y == 0 || (new_y as f32) < player_height {
+                            VoxelType::Ground
+                        } else {
+                            VoxelType::Wall
+                        };
+                        
+                        set_voxel(&mut state.world, new_x, new_y, new_z, voxel_type);
+                    }
                 }
             } else {
-                // If clicking on an existing voxel, try to place a new one based on the clicked face
-                let (new_x, new_y, new_z) = if normal.x > 0.5 { (x + 1, y, z) }
-                    else if normal.x < -0.5 { (x - 1, y, z) }
-                    else if normal.y > 0.5 { (x, y + 1, z) }
-                    else if normal.y < -0.5 { (x, y - 1, z) }
-                    else if normal.z > 0.5 { (x, y, z + 1) }
-                    else { (x, y, z - 1) };
-
-                if new_x >= 0 && new_x < state.world.width &&
-                   new_y >= 0 && new_y < state.world.height &&
-                   new_z >= 0 && new_z < state.world.depth &&
-                   get_voxel(&state.world, new_x, new_y, new_z) == VoxelType::Empty &&
-                   !is_voxel_occupied_by_player(state, new_x, new_y, new_z) {
-                    // Get player height (assuming first player)
-                    let player_height = if let Some(player) = state.players.get(&0) {
-                        player.position.y
-                    } else {
-                        1.0 // Default height if no player
-                    };
-                    
-                    // Set voxel type based on height relative to player
-                    let voxel_type = if new_y == 0 || (new_y as f32) < player_height {
-                        VoxelType::Ground
-                    } else {
-                        VoxelType::Wall
-                    };
-                    
-                    set_voxel(&mut state.world, new_x, new_y, new_z, voxel_type);
+                // Remove mode - remove existing voxels
+                if existing_voxel != VoxelType::Empty && !is_voxel_occupied_by_player(state, x, y, z) {
+                    set_voxel(&mut state.world, x, y, z, VoxelType::Empty);
                 }
             }
         }
-        if unsafe { ffi::IsMouseButtonPressed(MouseButton::MOUSE_BUTTON_RIGHT as i32) } {
-            // Only remove if there's a voxel at this position and it's not occupied by a player
+        
+        // Check for continuous removal with Ctrl+left click
+        let is_ctrl_pressed = unsafe { ffi::IsKeyDown(KeyboardKey::KEY_LEFT_CONTROL as i32) };
+        let is_left_pressed = unsafe { ffi::IsMouseButtonDown(MouseButton::MOUSE_BUTTON_LEFT as i32) };
+        if !state.editor.build_mode && is_ctrl_pressed && is_left_pressed {
             if existing_voxel != VoxelType::Empty && !is_voxel_occupied_by_player(state, x, y, z) {
                 set_voxel(&mut state.world, x, y, z, VoxelType::Empty);
             }
@@ -400,7 +632,154 @@ fn handle_voxel_input(state: &mut GameState) {
     }
 }
 
-pub fn get_voxel(world: &World, x: i32, y: i32, z: i32) -> VoxelType {
+fn update_camera(state: &mut GameState, delta: f32) {
+    // Handle transition from debug mode
+    if let Some(pre_camera) = &state.editor.camera.game_camera {
+        let transition_speed = 5.0 * delta;
+        
+        // Smoothly transition camera position and target
+        state.camera_state.camera.position = state.camera_state.camera.position.lerp(
+            pre_camera.position,
+            transition_speed
+        );
+        state.camera_state.camera.target = state.camera_state.camera.target.lerp(
+            pre_camera.target,
+            transition_speed
+        );
+        
+        if let Some(pre_offset) = &state.editor.camera.game_camera_offset {
+            state.camera_state.offset = state.camera_state.offset.lerp(
+                *pre_offset,
+                transition_speed
+            );
+        }
+        
+        if let Some(pre_height) = &state.editor.camera.game_camera_height {
+            state.camera_state.height = lerp_f32(state.camera_state.height, *pre_height, transition_speed);
+        }
+        
+        if let Some(pre_angle) = &state.editor.camera.game_camera_angle {
+            state.camera_state.angle = lerp_f32(state.camera_state.angle, *pre_angle, transition_speed);
+        }
+        
+        // Only clear pre-debug state and allow normal camera logic once transition is complete
+        if (state.camera_state.camera.position - pre_camera.position).length() < 0.1 {
+            state.editor.camera.game_camera = None;
+            state.editor.camera.game_camera_offset = None;
+            state.editor.camera.game_camera_height = None;
+            state.editor.camera.game_camera_angle = None;
+        } else {
+            return;
+        }
+    }
+
+    // Debug mode camera controls
+    if state.editor.active {
+        // Set center point to the center of the world at y=0
+        state.editor.camera.center = Vector3::new(
+            state.world.width as f32 * state.world.voxel_size / 2.0,
+            0.0,
+            state.world.depth as f32 * state.world.voxel_size / 2.0
+        );
+
+        // Handle mouse wheel zoom in debug mode
+        let wheel_move = unsafe { ffi::GetMouseWheelMove() as f32 };
+        if wheel_move != 0.0 {
+            state.editor.camera.distance = (state.editor.camera.distance * (1.0 - wheel_move * 0.1)).clamp(5.0, 50.0);
+        }
+
+        // Handle middle mouse button rotation
+        if unsafe { ffi::IsMouseButtonDown(MouseButton::MOUSE_BUTTON_MIDDLE as i32) } {
+            let mouse_delta = unsafe { ffi::GetMouseDelta() };
+            state.editor.camera.rotation.x -= mouse_delta.x * 0.01;
+            state.editor.camera.rotation.y = (state.editor.camera.rotation.y + mouse_delta.y * 0.01).clamp(-1.5, 1.5);
+        }
+
+        // Calculate camera position based on rotation and distance
+        let yaw = state.editor.camera.rotation.x;
+        let pitch = state.editor.camera.rotation.y;
+        
+        let cos_pitch = pitch.cos();
+        let sin_pitch = pitch.sin();
+        let cos_yaw = yaw.cos();
+        let sin_yaw = yaw.sin();
+
+        // Calculate camera position using spherical coordinates
+        let camera_x = state.editor.camera.center.x + state.editor.camera.distance * cos_pitch * sin_yaw;
+        let camera_y = state.editor.camera.center.y + state.editor.camera.distance * sin_pitch;
+        let camera_z = state.editor.camera.center.z + state.editor.camera.distance * cos_pitch * cos_yaw;
+
+        // Smoothly transition to debug camera position and target
+        let transition_speed = 5.0 * delta;
+        state.camera_state.camera.position = state.camera_state.camera.position.lerp(
+            Vector3::new(camera_x, camera_y, camera_z),
+            transition_speed
+        );
+        state.camera_state.camera.target = state.camera_state.camera.target.lerp(
+            state.editor.camera.center,
+            transition_speed
+        );
+    } else {
+        // Game mode camera controls
+        if !state.players.is_empty() {
+            // Calculate center point between all players
+            let mut center = Vector3::zero();
+            let mut min_x = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut min_z = f32::MAX;
+            let mut max_z = f32::MIN;
+            
+            for player in state.players.values() {
+                center += player.position;
+                min_x = min_x.min(player.position.x);
+                max_x = max_x.max(player.position.x);
+                min_z = min_z.min(player.position.z);
+                max_z = max_z.max(player.position.z);
+            }
+            
+            center /= state.players.len() as f32;
+            
+            // Calculate required distance to see all players
+            let width = max_x - min_x;
+            let depth = max_z - min_z;
+            let max_dimension = width.max(depth);
+            
+            // Calculate target height and distance based on player spread
+            let target_height = (max_dimension * 0.5).max(15.0).min(30.0);
+            let target_distance = (max_dimension * 0.7).max(20.0).min(40.0);
+            
+            // Smoothly adjust camera height and distance with slower speed
+            let height_transition_speed = 1.0 * delta;
+            let distance_transition_speed = 1.0 * delta;
+            state.camera_state.height = lerp_f32(state.camera_state.height, target_height, height_transition_speed);
+            state.camera_state.offset.z = lerp_f32(state.camera_state.offset.z, target_distance, distance_transition_speed);
+            
+            // Calculate target camera position
+            let target_camera_pos = center + state.camera_state.offset;
+            
+            // Smoothly interpolate camera position and target with delay
+            let position_transition_speed = 2.0 * delta;
+            let target_transition_speed = 2.0 * delta;
+            
+            state.camera_state.camera.position = state.camera_state.camera.position.lerp(
+                Vector3::new(target_camera_pos.x, state.camera_state.height, target_camera_pos.z),
+                position_transition_speed
+            );
+            
+            // Always look at the center of the player group
+            state.camera_state.camera.target = state.camera_state.camera.target.lerp(
+                center,
+                target_transition_speed
+            );
+        }
+    }
+}
+
+fn is_valid_position(world: &World, x: i32, y: i32, z: i32) -> bool {
+    x >= 0 && x < world.width && y >= 0 && y < world.height && z >= 0 && z < world.depth
+}
+
+fn get_voxel(world: &World, x: i32, y: i32, z: i32) -> VoxelType {
     if is_valid_position(world, x, y, z) {
         if let Some(voxel) = world.voxels.iter().find(|v| v.position.x == x as f32 && v.position.y == y as f32 && v.position.z == z as f32) {
             voxel.voxel_type
@@ -412,7 +791,7 @@ pub fn get_voxel(world: &World, x: i32, y: i32, z: i32) -> VoxelType {
     }
 }
 
-pub fn set_voxel(world: &mut World, x: i32, y: i32, z: i32, voxel_type: VoxelType) {
+fn set_voxel(world: &mut World, x: i32, y: i32, z: i32, voxel_type: VoxelType) {
     if is_valid_position(world, x, y, z) {
         if let Some(voxel) = world.voxels.iter_mut().find(|v| v.position.x == x as f32 && v.position.y == y as f32 && v.position.z == z as f32) {
             voxel.voxel_type = voxel_type;
@@ -420,31 +799,4 @@ pub fn set_voxel(world: &mut World, x: i32, y: i32, z: i32, voxel_type: VoxelTyp
             world.voxels.push(Voxel { position: Vector3::new(x as f32, y as f32, z as f32), voxel_type });
         }
     }
-}
-
-fn is_valid_position(world: &World, x: i32, y: i32, z: i32) -> bool {
-    x >= 0 && x < world.width && y >= 0 && y < world.height && z >= 0 && z < world.depth
-}
-
-fn update_camera(state: &mut GameState, delta: f32) {
-    if let Some(player) = state.players.get(&0) { // Follow first player
-        // Calculate target camera position with fixed height and angle
-        let angle_rad = state.camera_angle.to_radians();
-        
-        // Calculate target position behind player
-        let target_x = player.position.x + state.camera_offset.z * angle_rad.sin();
-        let target_z = player.position.z + state.camera_offset.z * angle_rad.cos();
-        
-        // Create target position vector
-        let target_position = Vector3::new(target_x, state.camera_height, target_z);
-        
-        // Smoothly move camera towards target position
-        state.camera.position = state.camera.position.lerp(
-            target_position,
-            state.camera_smoothing * delta * 10.0
-        );
-        
-        // Update camera target to look at player
-        state.camera.target = player.position;
-    }
-}
+} 
